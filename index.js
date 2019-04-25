@@ -136,6 +136,7 @@ Swarm.prototype.leave = function (name) {
   }
 }
 
+// peer object example: { host, port, channel }
 Swarm.prototype.addPeer = function (peer) {
   peer = peerify(peer)
   if (this._peersSeen[peer.id]) return
@@ -145,6 +146,7 @@ Swarm.prototype.addPeer = function (peer) {
   this._kick()
 }
 
+// peer object example: { host, port, channel }
 Swarm.prototype.removePeer = function (peer) {
   peer = peerify(peer)
   this._peersSeen[peer.id] = PEER_BANNED
@@ -186,6 +188,7 @@ Swarm.prototype._ondiscover = function () {
   }
 
   function onpeer (channel, peer) {
+    peer.channel = channel;
     var id = peer.host + ':' + peer.port
     if (self._peersSeen[id]) return
     self._peersSeen[id] = PEER_SEEN
@@ -442,6 +445,7 @@ function onerror () {
 }
 
 function peerify (peer) {
+  if (!peer.channel) peer.channel = null;
   if (typeof peer === 'number') peer = {port: peer}
   if (!peer.host) peer.host = '127.0.0.1'
   peer.id = peer.host + ':' + peer.port
