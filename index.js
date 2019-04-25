@@ -3,11 +3,11 @@ var pump = require('pump')
 var events = require('events')
 var util = require('util')
 var net = require('net')
+var equals = require('buffer-equals')
 var toBuffer = require('to-buffer')
 var crypto = require('crypto')
 var lpmessage = require('length-prefixed-message')
 var connections = require('connections')
-var debug = require('debug')('discovery-swarm')
 
 try {
   var utp = require('utp-native')
@@ -41,7 +41,6 @@ function Swarm (opts) {
 
   this._stream = opts.stream
   this._options = opts || {}
-  this._whitelist = opts.whitelist || []
   this._discovery = null
   this._tcp = opts.tcp === false ? null : net.createServer().on('connection', onconnection)
   this._utp = opts.utp === false || !utp ? null : utp().on('connection', onconnection)
@@ -53,15 +52,11 @@ function Swarm (opts) {
   this._peersSeen = {}
   this._peersQueued = []
 
-  if (this._options.discovery !== false) {
-    this.on('listening', this._ondiscover)
-  }
+  if (this._options.discovery !== false) this.on('listening', this._ondiscover)
 
   function onconnection (connection) {
-    var type = this === self._tcp ? 'tcp' : 'utp'
-    debug('inbound connection type=%s ip=%s:%d', type, connection.remoteAddress, connection.remotePort)
+    var type = this === this._tcp ? 'tcp' : 'utp'
     connection.on('error', onerror)
-    self.totalConnections++
     self._onconnection(connection, type, null)
   }
 }
@@ -95,8 +90,6 @@ Swarm.prototype.destroy = function (onclose) {
   if (this._listening) {
     if (this._tcp) this._tcp.close(onserverclose)
     if (this._utp) this._utp.close(onserverclose)
-  } else {
-    this.emit('close')
   }
 
   function onserverclose () {
@@ -116,20 +109,15 @@ Swarm.prototype.__defineGetter__('connected', function () {
   return this.connections.length
 })
 
-Swarm.prototype.join = function (name, opts, cb) {
-  if (typeof opts === 'function') return this.join(name, {}, opts)
+Swarm.prototype.join = function (name) {
   name = toBuffer(name)
-  if (!opts) opts = {}
-  if (typeof opts.announce === 'undefined') opts.announce = true
 
   if (!this._listening && !this._adding) this._listenNext()
 
   if (this._adding) {
-    this._adding.push({ name: name, opts: opts, cb: cb })
+    this._adding.push(name)
   } else {
-    var port
-    if (opts.announce) port = this.address().port
-    this._discovery.join(name, port, { impliedPort: opts.announce && !!this._utp }, cb)
+    this._discovery.join(name, this._tcp.address().port, {impliedPort: !!this._utp})
   }
 }
 
@@ -138,30 +126,28 @@ Swarm.prototype.leave = function (name) {
 
   if (this._adding) {
     for (var i = 0; i < this._adding.length; i++) {
-      if (name.equals(this._adding[i].name)) {
+      if (equals(this._adding[i], name)) {
         this._adding.splice(i, 1)
         return
       }
     }
   } else {
-    this._discovery.leave(name, this.address() ? this.address().port : 0)
+    this._discovery.leave(name, this._tcp.address().port)
   }
 }
 
-Swarm.prototype.addPeer = function (name, peer) {
-  peer = peerify(peer, toBuffer(name))
+Swarm.prototype.addPeer = function (peer) {
+  peer = peerify(peer)
   if (this._peersSeen[peer.id]) return
-  if (this._whitelist.length && this._whitelist.indexOf(peer.host) === -1) return
   this._peersSeen[peer.id] = PEER_SEEN
   this._peersQueued.push(peer)
   this.emit('peer', peer)
   this._kick()
 }
 
-Swarm.prototype.removePeer = function (name, peer) {
-  peer = peerify(peer, toBuffer(name))
+Swarm.prototype.removePeer = function (peer) {
+  peer = peerify(peer)
   this._peersSeen[peer.id] = PEER_BANNED
-  this.emit('peer-banned', peer, { reason: 'application' })
 }
 
 Swarm.prototype._dropPeer = function (peer) {
@@ -175,7 +161,7 @@ Swarm.prototype.address = function () {
 
 Swarm.prototype._ondiscover = function () {
   var self = this
-  var joins = this._adding
+  var names = this._adding
 
   if (this._options.dns !== false) {
     if (!this._options.dns || this._options.dns === true) this._options.dns = {}
@@ -186,13 +172,14 @@ Swarm.prototype._ondiscover = function () {
     if (!this._options.dht || this._options.dht === true) this._options.dht = {}
     this._options.dht.socket = this._utp
   }
+
   this._discovery = discovery(this._options)
   this._discovery.on('peer', onpeer)
   this._discovery.on('whoami', onwhoami)
   this._adding = null
 
-  if (!joins) return
-  for (var i = 0; i < joins.length; i++) this.join(joins[i].name, joins[i].opts, joins[i].cb)
+  if (!names) return
+  for (var i = 0; i < names.length; i++) this.join(names[i])
 
   function onwhoami (me) {
     self._peersSeen[me.host + ':' + me.port] = PEER_BANNED
@@ -200,18 +187,9 @@ Swarm.prototype._ondiscover = function () {
 
   function onpeer (channel, peer) {
     var id = peer.host + ':' + peer.port
-    var longId = id + '@' + (channel ? channel.toString('hex') : '')
-    if (self._whitelist.length && self._whitelist.indexOf(peer.host) === -1) {
-      self.emit('peer-rejected', peer, { reason: 'whitelist' })
-      return
-    }
-    var peerSeen = self._peersSeen[id] || self._peersSeen[longId]
-    if (peerSeen) {
-      self.emit('peer-rejected', peer, { reason: (peerSeen === PEER_BANNED) ? 'banned' : 'duplicate' })
-      return
-    }
-    self._peersSeen[longId] = PEER_SEEN
-    self._peersQueued.push(peerify(peer, channel))
+    if (self._peersSeen[id]) return
+    self._peersSeen[id] = PEER_SEEN
+    self._peersQueued.push(peerify(peer))
     self.emit('peer', peer)
     self._kick()
   }
@@ -223,7 +201,6 @@ Swarm.prototype._kick = function () {
 
   var self = this
   var connected = false
-  var didTimeOut = false
   var next = this._peersQueued.shift()
   while (next && this._peersSeen[next.id] === PEER_BANNED) {
     next = this._peersQueued.shift()
@@ -233,7 +210,6 @@ Swarm.prototype._kick = function () {
 
   this.totalConnections++
   this.emit('connecting', next)
-  debug('connecting %s retries=%d', next.id, next.retries)
 
   var tcpSocket = null
   var utpSocket = null
@@ -252,53 +228,37 @@ Swarm.prototype._kick = function () {
   if (this._utp) {
     utpClosed = false
     utpSocket = this._utp.connect(next.port, next.host)
-    utpSocket.on('connect', ondeferredconnect)
+    utpSocket.on('connect', onconnect)
     utpSocket.on('error', onerror)
     utpSocket.on('close', onclose)
   }
 
   var timeout = setTimeoutUnref(ontimeout, CONNECTION_TIMEOUT)
 
-  function ondeferredconnect () {
-    if (!self._tcp || tcpClosed) return onconnect.call(utpSocket)
-    setTimeout(function () {
-      if (!utpClosed && !connected) onconnect.call(utpSocket)
-    }, 500)
-  }
-
   function ontimeout () {
-    debug('timeout %s', next.id)
-    didTimeOut = true
     if (utpSocket) utpSocket.destroy()
     if (tcpSocket) tcpSocket.destroy()
-  }
-
-  function cleanup () {
-    clearTimeout(timeout)
-    if (utpSocket) utpSocket.removeListener('close', onclose)
-    if (tcpSocket) tcpSocket.removeListener('close', onclose)
   }
 
   function onclose () {
     if (this === utpSocket) utpClosed = true
     if (this === tcpSocket) tcpClosed = true
     if (tcpClosed && utpClosed) {
-      debug('onclose utp+tcp %s will-requeue=%d', next.id, !connected)
-      cleanup()
-      if (!connected) {
-        self.totalConnections--
-        self.emit('connect-failed', next, { timedout: didTimeOut })
-        self._requeue(next)
-      }
+      clearTimeout(timeout)
+      if (utpSocket) utpSocket.removeListener('close', onclose)
+      if (tcpSocket) tcpSocket.removeListener('close', onclose)
+      self.totalConnections--
+      if (!connected) self._requeue(next)
     }
   }
 
   function onconnect () {
     connected = true
-    cleanup()
+    utpClosed = tcpClosed = true
+    onclose() // decs totalConnections which _onconnection also incs
 
     var type = this === utpSocket ? 'utp' : 'tcp'
-    debug('onconnect %s type=%s', next.id, type)
+
     if (type === 'utp' && tcpSocket) tcpSocket.destroy()
     if (type === 'tcp' && utpSocket) utpSocket.destroy()
 
@@ -320,58 +280,34 @@ Swarm.prototype._requeue = function (peer) {
   }
 }
 
-var connectionDebugIdCounter = 0
 Swarm.prototype._onconnection = function (connection, type, peer) {
   var self = this
   var idHex = this.id.toString('hex')
   var remoteIdHex
 
-  // internal variables used for debugging
-  connection._debugId = ++connectionDebugIdCounter
-  connection._debugStartTime = Date.now()
-
-  var info = {
-    type: type,
-    initiator: !!peer,
-    id: null,
-    host: peer ? peer.host : connection.remoteAddress,
-    port: peer ? peer.port : connection.remotePort,
-    channel: peer ? peer.channel : null
-  }
-  this.emit('handshaking', connection, info)
-
+  this.totalConnections++
   connection.on('close', onclose)
 
   if (this._stream) {
     var wire = connection
-    connection = this._stream(info)
-    connection._debugId = wire._debugId
-    connection._debugStartTime = wire._debugStartTime
+    connection = this._stream()
     if (connection.id) idHex = connection.id.toString('hex')
     connection.on('handshake', onhandshake)
-    if (this._options.connect) this._options.connect(connection, wire)
-    else pump(wire, connection, wire)
+    pump(wire, connection, wire)
   } else {
     handshake(connection, this.id, onhandshake)
-  }
-
-  var wrap = {
-    info: info,
-    connection: connection
   }
 
   var timeout = setTimeoutUnref(ontimeout, HANDSHAKE_TIMEOUT)
   if (this.destroyed) connection.destroy()
 
   function ontimeout () {
-    self.emit('handshake-timeout', connection, info)
     connection.destroy()
   }
 
   function onclose () {
     clearTimeout(timeout)
     self.totalConnections--
-    self.emit('connection-closed', connection, info)
 
     var i = self.connections.indexOf(connection)
     if (i > -1) {
@@ -379,7 +315,7 @@ Swarm.prototype._onconnection = function (connection, type, peer) {
       if (last !== connection) self.connections[i] = last
     }
 
-    if (remoteIdHex && self._peersIds[remoteIdHex] && self._peersIds[remoteIdHex].connection === connection) {
+    if (remoteIdHex && self._peersIds[remoteIdHex] === connection) {
       delete self._peersIds[remoteIdHex]
       if (peer) self._requeue(peer)
     }
@@ -389,47 +325,29 @@ Swarm.prototype._onconnection = function (connection, type, peer) {
     if (!remoteId) remoteId = connection.remoteId
     clearTimeout(timeout)
     remoteIdHex = remoteId.toString('hex')
-
-    if (Buffer.isBuffer(connection.discoveryKey) || Buffer.isBuffer(connection.channel)) {
-      var suffix = '@' + (connection.discoveryKey || connection.channel).toString('hex')
-      remoteIdHex += suffix
-      idHex += suffix
-    }
-
     if (peer) peer.retries = 0
 
     if (idHex === remoteIdHex) {
-      if (peer) {
-        self._peersSeen[peer.id] = PEER_BANNED
-        self.emit('peer-banned', { peer: peer, reason: 'detected-self' })
-      }
+      if (peer) self._peersSeen[peer.id] = PEER_BANNED
       connection.destroy()
       return
     }
 
-    var oldWrap = self._peersIds[remoteIdHex]
-    var old = oldWrap && oldWrap.connection
-    var oldType = oldWrap && oldWrap.info.type
+    var old = self._peersIds[remoteIdHex]
 
     if (old) {
-      debug('duplicate connections detected in handshake, dropping one')
-      if (!(oldType === 'utp' && type === 'tcp')) {
-        if ((peer && remoteIdHex < idHex) || (!peer && remoteIdHex > idHex) || (type === 'utp' && oldType === 'tcp')) {
-          self.emit('redundant-connection', connection, info)
-          connection.destroy()
-          return
-        }
+      if ((peer && remoteIdHex < idHex) || (!peer && remoteIdHex > idHex)) {
+        connection.destroy()
+        return
       }
-      self.emit('redundant-connection', old, info)
       delete self._peersIds[remoteIdHex] // delete to not trigger re-queue
       old.destroy()
       old = null // help gc
     }
 
-    self._peersIds[remoteIdHex] = wrap
+    self._peersIds[remoteIdHex] = connection
     self.connections.push(connection)
-    info.id = remoteId
-    self.emit('connection', connection, info)
+    self.emit('connection', connection, remoteId)
   }
 }
 
@@ -442,7 +360,6 @@ Swarm.prototype._listenNext = function () {
 }
 
 Swarm.prototype.listen = function (port, onlistening) {
-  if (this.destroyed) return
   if (this._tcp && this._utp) return this._listenBoth(port, onlistening)
   if (!port) port = 0
   if (onlistening) this.once('listening', onlistening)
@@ -524,12 +441,11 @@ function onerror () {
   this.destroy()
 }
 
-function peerify (peer, channel) {
-  if (typeof peer === 'number') peer = { port: peer }
+function peerify (peer) {
+  if (typeof peer === 'number') peer = {port: peer}
   if (!peer.host) peer.host = '127.0.0.1'
-  peer.id = peer.host + ':' + peer.port + '@' + (channel ? channel.toString('hex') : '')
+  peer.id = peer.host + ':' + peer.port
   peer.retries = 0
-  peer.channel = channel
   return peer
 }
 
