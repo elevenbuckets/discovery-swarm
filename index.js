@@ -188,7 +188,7 @@ Swarm.prototype._ondiscover = function () {
   }
 
   function onpeer (channel, peer) {
-    peer.channel = channel;
+    peer.channel = channel.toString('hex');
     var id = peer.host + ':' + peer.port
     if (self._peersSeen[id]) return
     self._peersSeen[id] = PEER_SEEN
